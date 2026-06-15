@@ -1,0 +1,10 @@
+# ownHUBAI llama.cpp fork — upstream base pin
+# See README-ownhubai.md and ownHUBAI docs/adr/0004 for the strategy.
+
+UPSTREAM_REPO=ggml-org/llama.cpp
+UPSTREAM_TAG=b9656
+UPSTREAM_COMMIT=581e8eca8b41
+PINNED_ON=2026-06-15
+
+# Rebase the ownhubai patch stack onto a newer tag deliberately (≈monthly or when
+# a needed feature lands), then update this file and re-run the eval gate.
