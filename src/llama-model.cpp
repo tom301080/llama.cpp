@@ -1703,6 +1703,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+#if !defined(_WIN32)
+    // ownHUBAI: unconditional diagnostic (stderr bypasses the suppressed model-load
+    // INFO channel) — confirms the pager gate is reached and what it sees.
+    fprintf(stderr, "[ownHUBAI] load_tensors tail: use_mmap_buffer=%d PREFETCH=%s RANDOM=%s mappings=%zu layers=%zu\n",
+            (int) use_mmap_buffer,
+            getenv("OWNHUB_MOE_PREFETCH")    ? "set" : "unset",
+            getenv("OWNHUB_MOE_MADV_RANDOM") ? "set" : "unset",
+            pimpl->mappings.size(), layers.size());
+#endif
+
     // ownHUBAI: MoE expert-offload paging (Strategy A, ADR 0005). When experts are
     // mmap-offloaded (--cpu-moe / --n-cpu-moe): OWNHUB_MOE_MADV_RANDOM advises
     // RANDOM (sparse MoE access → no wasted read-ahead/RAM); OWNHUB_MOE_PREFETCH
@@ -1747,8 +1757,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
         g_ownhub_moe_pager.active = do_pager;
-        LLAMA_LOG_INFO("%s: ownHUBAI MoE offload: random=%d pager=%d (%zu mmap'd expert tensors, %zu layers)\n",
-                __func__, (int) do_random, (int) do_pager, tuned, g_ownhub_moe_pager.layers.size());
+        fprintf(stderr, "[ownHUBAI] MoE offload ACTIVE: random=%d pager=%d (%zu mmap'd expert tensors, %zu layers)\n",
+                (int) do_random, (int) do_pager, tuned, g_ownhub_moe_pager.layers.size());
     }
 #endif
 
