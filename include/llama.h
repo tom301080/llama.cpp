@@ -1553,6 +1553,7 @@ extern "C" {
     // when experts are mmap-offloaded. Both are no-ops on the default path.
     LLAMA_API int  llama_ownhub_moe_active(void);
     LLAMA_API void llama_ownhub_moe_advise(int il, const int32_t * experts, int n, int willneed);
+    LLAMA_API void llama_ownhub_moe_step(void); // inc3: advance a forward; periodic cold-tail DONTNEED
 
     //
     // training

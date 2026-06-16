@@ -43,8 +43,12 @@ inline bool common_moe_stats_eval_cb(struct ggml_tensor * t, bool ask, void * us
             if (dash) { il = atoi(dash + 1); }
             // ownHUBAI: prefetch — WILLNEED the just-used experts (temporal
             // locality: likely reused next token). No-op unless the engine pager
-            // is active (OWNHUB_MOE_PREFETCH + mmap-offloaded experts).
+            // is active (OWNHUB_MOE_PREFETCH + mmap-offloaded experts). inc3: tick
+            // the pager once per forward (layer 0) so it can sweep the cold tail.
             if (llama_ownhub_moe_active()) {
+                if (il == 0) {
+                    llama_ownhub_moe_step();
+                }
                 llama_ownhub_moe_advise(il, ids.data(), (int) n, /*willneed=*/1);
             }
             // telemetry accumulation (only when --moe-expert-stats gave a sink)

@@ -1220,10 +1220,14 @@ namespace {
         size_t    stride[3] = { 0, 0, 0 };                   // per-expert byte stride (nb[2])
         size_t    bytes[3]  = { 0, 0, 0 };                   // bytes per expert
         int       n_expert  = 0;
+        std::vector<uint32_t> last_used;                     // per-expert last tick used (0 = cold/never)
     };
     struct ownhub_moe_pager {
         std::vector<ownhub_moe_layer> layers;
-        bool active = false;
+        bool     active      = false;
+        uint32_t tick        = 0;   // ~one per forward (incremented at layer 0)
+        uint32_t evict_every = 8;   // run the cold-tail sweep every N forwards (OWNHUB_MOE_EVICT_EVERY)
+        uint32_t evict_age   = 32;  // DONTNEED an expert unused for this many forwards (OWNHUB_MOE_EVICT_AGE)
     };
     ownhub_moe_pager g_ownhub_moe_pager;
 }
@@ -1238,12 +1242,15 @@ void llama_ownhub_moe_advise(int il, const int32_t * experts, int n, int willnee
     if (!p.active || !experts || il < 0 || il >= (int) p.layers.size()) {
         return;
     }
-    const ownhub_moe_layer & L = p.layers[il];
+    ownhub_moe_layer & L = p.layers[il];
     const int advice = willneed ? POSIX_MADV_WILLNEED : POSIX_MADV_DONTNEED;
     for (int i = 0; i < n; ++i) {
         const int e = experts[i];
         if (e < 0 || e >= L.n_expert) {
             continue;
+        }
+        if (willneed && !L.last_used.empty()) {
+            L.last_used[e] = p.tick; // recency for the cold-tail sweep (inc3)
         }
         for (int k = 0; k < 3; ++k) {
             if (L.data[k]) {
@@ -1253,6 +1260,35 @@ void llama_ownhub_moe_advise(int il, const int32_t * experts, int n, int willnee
     }
 #else
     (void) il; (void) experts; (void) n; (void) willneed;
+#endif
+}
+
+// ownHUBAI inc3: advance one forward; periodically DONTNEED the cold tail (experts
+// not used within evict_age forwards) to relieve RAM pressure so the hot set stays
+// resident. Called once per decode step by the routing driver.
+void llama_ownhub_moe_step(void) {
+#if !defined(_WIN32)
+    ownhub_moe_pager & p = g_ownhub_moe_pager;
+    if (!p.active) {
+        return;
+    }
+    p.tick++;
+    if (p.evict_every == 0 || (p.tick % p.evict_every) != 0) {
+        return;
+    }
+    const uint32_t cutoff = (p.tick > p.evict_age) ? (p.tick - p.evict_age) : 0;
+    for (ownhub_moe_layer & L : p.layers) {
+        for (int e = 0; e < (int) L.last_used.size(); ++e) {
+            if (L.last_used[e] != 0 && L.last_used[e] < cutoff) {
+                for (int k = 0; k < 3; ++k) {
+                    if (L.data[k]) {
+                        posix_madvise(L.data[k] + (size_t) e * L.stride[k], L.bytes[k], POSIX_MADV_DONTNEED);
+                    }
+                }
+                L.last_used[e] = 0; // mark cold; re-armed on next use
+            }
+        }
+    }
 #endif
 }
 
@@ -1686,6 +1722,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             return false;
         };
         size_t tuned = 0;
+        g_ownhub_moe_pager.tick = 0;
+        if (const char * s = getenv("OWNHUB_MOE_EVICT_EVERY")) { g_ownhub_moe_pager.evict_every = (uint32_t) atoi(s); }
+        if (const char * s = getenv("OWNHUB_MOE_EVICT_AGE"))   { g_ownhub_moe_pager.evict_age   = (uint32_t) atoi(s); }
         g_ownhub_moe_pager.layers.clear();
         g_ownhub_moe_pager.layers.resize(layers.size());
         for (size_t il = 0; il < layers.size(); ++il) {
@@ -1702,6 +1741,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     L.bytes[k]  = t->nb[2];
                     L.n_expert  = (int) t->ne[2];
                 }
+            }
+            if (L.n_expert > 0) {
+                L.last_used.assign((size_t) L.n_expert, 0u); // inc3: per-expert recency for cold-tail eviction
             }
         }
         g_ownhub_moe_pager.active = do_pager;
