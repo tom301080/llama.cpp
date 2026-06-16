@@ -5,6 +5,10 @@
 #include "llama-hparams.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
+#if !defined(_WIN32)
+#include <sys/mman.h> // ownHUBAI: posix_madvise for MoE expert-offload paging hints (ADR 0005)
+#include <cstdlib>
+#endif
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 
@@ -1616,6 +1620,43 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+    // ownHUBAI: MoE expert-offload paging hint (Strategy A — ADR 0005 /
+    // docs/moe-expert-offload-concept.md). When experts are mmap-offloaded
+    // (e.g. --cpu-moe / --n-cpu-moe) and OWNHUB_MOE_MADV_RANDOM=1, advise RANDOM
+    // access on the expert regions so the OS does not waste read-ahead bandwidth
+    // or RAM on cold experts — MoE expert access is sparse. Opt-in; the default
+    // path (env unset) is byte-for-byte stock behavior.
+#if !defined(_WIN32)
+    if (use_mmap_buffer && getenv("OWNHUB_MOE_MADV_RANDOM")) {
+        size_t tuned = 0;
+        auto in_mmap = [&](void * d, size_t n) -> bool {
+            for (auto & m : pimpl->mappings) {
+                char * base = (char *) m->addr();
+                if ((char *) d >= base && (char *) d + n <= base + m->size()) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto advise = [&](ggml_tensor * t) {
+            if (!t || !t->data) {
+                return;
+            }
+            const size_t n = ggml_nbytes(t);
+            if (in_mmap(t->data, n) && posix_madvise(t->data, n, POSIX_MADV_RANDOM) == 0) {
+                tuned++;
+            }
+        };
+        for (auto & layer : layers) {
+            advise(layer.ffn_gate_exps);
+            advise(layer.ffn_up_exps);
+            advise(layer.ffn_down_exps);
+        }
+        LLAMA_LOG_INFO("%s: ownHUBAI MoE offload: POSIX_MADV_RANDOM on %zu mmap'd expert tensors\n",
+                __func__, tuned);
+    }
+#endif
 
     return true;
 }
