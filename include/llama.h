@@ -1548,6 +1548,12 @@ extern "C" {
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
 
+    // ownHUBAI: MoE expert-offload pager (Strategy A, ADR 0005). Engine-side
+    // per-expert mmap madvise driven by routing; enabled via OWNHUB_MOE_PREFETCH
+    // when experts are mmap-offloaded. Both are no-ops on the default path.
+    LLAMA_API int  llama_ownhub_moe_active(void);
+    LLAMA_API void llama_ownhub_moe_advise(int il, const int32_t * experts, int n, int willneed);
+
     //
     // training
     //

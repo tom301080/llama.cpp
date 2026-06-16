@@ -1210,6 +1210,52 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// ownHUBAI: MoE expert pager — engine-side per-expert mmap madvise for the
+// expert-offload cache (Strategy A inc2, ADR 0005 / moe-expert-offload-concept.md).
+// Populated at load when OWNHUB_MOE_PREFETCH is set; driven from routing via
+// llama_ownhub_moe_advise(). No-op on the default path.
+namespace {
+    struct ownhub_moe_layer {
+        uint8_t * data[3]   = { nullptr, nullptr, nullptr }; // gate, up, down
+        size_t    stride[3] = { 0, 0, 0 };                   // per-expert byte stride (nb[2])
+        size_t    bytes[3]  = { 0, 0, 0 };                   // bytes per expert
+        int       n_expert  = 0;
+    };
+    struct ownhub_moe_pager {
+        std::vector<ownhub_moe_layer> layers;
+        bool active = false;
+    };
+    ownhub_moe_pager g_ownhub_moe_pager;
+}
+
+int llama_ownhub_moe_active(void) {
+    return g_ownhub_moe_pager.active ? 1 : 0;
+}
+
+void llama_ownhub_moe_advise(int il, const int32_t * experts, int n, int willneed) {
+#if !defined(_WIN32)
+    ownhub_moe_pager & p = g_ownhub_moe_pager;
+    if (!p.active || !experts || il < 0 || il >= (int) p.layers.size()) {
+        return;
+    }
+    const ownhub_moe_layer & L = p.layers[il];
+    const int advice = willneed ? POSIX_MADV_WILLNEED : POSIX_MADV_DONTNEED;
+    for (int i = 0; i < n; ++i) {
+        const int e = experts[i];
+        if (e < 0 || e >= L.n_expert) {
+            continue;
+        }
+        for (int k = 0; k < 3; ++k) {
+            if (L.data[k]) {
+                posix_madvise(L.data[k] + (size_t) e * L.stride[k], L.bytes[k], advice);
+            }
+        }
+    }
+#else
+    (void) il; (void) experts; (void) n; (void) willneed;
+#endif
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
@@ -1621,15 +1667,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // ownHUBAI: MoE expert-offload paging hint (Strategy A — ADR 0005 /
-    // docs/moe-expert-offload-concept.md). When experts are mmap-offloaded
-    // (e.g. --cpu-moe / --n-cpu-moe) and OWNHUB_MOE_MADV_RANDOM=1, advise RANDOM
-    // access on the expert regions so the OS does not waste read-ahead bandwidth
-    // or RAM on cold experts — MoE expert access is sparse. Opt-in; the default
-    // path (env unset) is byte-for-byte stock behavior.
+    // ownHUBAI: MoE expert-offload paging (Strategy A, ADR 0005). When experts are
+    // mmap-offloaded (--cpu-moe / --n-cpu-moe): OWNHUB_MOE_MADV_RANDOM advises
+    // RANDOM (sparse MoE access → no wasted read-ahead/RAM); OWNHUB_MOE_PREFETCH
+    // builds the per-expert pager that llama_ownhub_moe_advise() uses at runtime to
+    // WILLNEED hot / DONTNEED cold experts. Opt-in; default path is stock.
 #if !defined(_WIN32)
-    if (use_mmap_buffer && getenv("OWNHUB_MOE_MADV_RANDOM")) {
-        size_t tuned = 0;
+    if (use_mmap_buffer && (getenv("OWNHUB_MOE_MADV_RANDOM") || getenv("OWNHUB_MOE_PREFETCH"))) {
+        const bool do_random = getenv("OWNHUB_MOE_MADV_RANDOM") != nullptr;
+        const bool do_pager  = getenv("OWNHUB_MOE_PREFETCH")    != nullptr;
         auto in_mmap = [&](void * d, size_t n) -> bool {
             for (auto & m : pimpl->mappings) {
                 char * base = (char *) m->addr();
@@ -1639,22 +1685,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             return false;
         };
-        auto advise = [&](ggml_tensor * t) {
-            if (!t || !t->data) {
-                return;
+        size_t tuned = 0;
+        g_ownhub_moe_pager.layers.clear();
+        g_ownhub_moe_pager.layers.resize(layers.size());
+        for (size_t il = 0; il < layers.size(); ++il) {
+            ggml_tensor * ts[3] = { layers[il].ffn_gate_exps, layers[il].ffn_up_exps, layers[il].ffn_down_exps };
+            ownhub_moe_layer & L = g_ownhub_moe_pager.layers[il];
+            for (int k = 0; k < 3; ++k) {
+                ggml_tensor * t = ts[k];
+                if (t && t->data && in_mmap(t->data, ggml_nbytes(t))) {
+                    if (do_random && posix_madvise(t->data, ggml_nbytes(t), POSIX_MADV_RANDOM) == 0) {
+                        tuned++;
+                    }
+                    L.data[k]   = (uint8_t *) t->data;
+                    L.stride[k] = t->nb[2];
+                    L.bytes[k]  = t->nb[2];
+                    L.n_expert  = (int) t->ne[2];
+                }
             }
-            const size_t n = ggml_nbytes(t);
-            if (in_mmap(t->data, n) && posix_madvise(t->data, n, POSIX_MADV_RANDOM) == 0) {
-                tuned++;
-            }
-        };
-        for (auto & layer : layers) {
-            advise(layer.ffn_gate_exps);
-            advise(layer.ffn_up_exps);
-            advise(layer.ffn_down_exps);
         }
-        LLAMA_LOG_INFO("%s: ownHUBAI MoE offload: POSIX_MADV_RANDOM on %zu mmap'd expert tensors\n",
-                __func__, tuned);
+        g_ownhub_moe_pager.active = do_pager;
+        LLAMA_LOG_INFO("%s: ownHUBAI MoE offload: random=%d pager=%d (%zu mmap'd expert tensors, %zu layers)\n",
+                __func__, (int) do_random, (int) do_pager, tuned, g_ownhub_moe_pager.layers.size());
     }
 #endif
 

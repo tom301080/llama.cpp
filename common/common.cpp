@@ -3,6 +3,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "moe-stats.h" // ownHUBAI: MoE expert-activation telemetry
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -1580,6 +1581,19 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.flash_attn_type   = params.flash_attn_type;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    // ownHUBAI: MoE expert-activation telemetry (routing-skew). When
+    // --moe-expert-stats is set and no other eval callback is in use, install the
+    // counting callback and print the skew summary at exit. See common/moe-stats.h.
+    if ((params.moe_expert_stats || getenv("OWNHUB_MOE_PREFETCH")) && cparams.cb_eval == nullptr) {
+        static common_moe_stats g_moe_stats;
+        static bool g_moe_stats_registered = false;
+        if (!g_moe_stats_registered) {
+            std::atexit([]() { common_moe_stats_print(g_moe_stats); });
+            g_moe_stats_registered = true;
+        }
+        cparams.cb_eval           = common_moe_stats_eval_cb;
+        cparams.cb_eval_user_data = &g_moe_stats;
+    }
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
