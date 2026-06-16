@@ -2355,6 +2355,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    // --- ownHUBAI: MoE expert-offload cache (ADR 0005 / moe-expert-offload-concept.md). Default OFF == stock. ---
+    add_opt(common_arg(
+        {"--moe-expert-cache-size"}, "N",
+        "ownHUBAI: number of wired hot-expert slots for MoE expert-offload (0 = off, mainline behavior)",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("invalid value"); }
+            params.moe_expert_cache_size = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-policy"}, "POLICY",
+        "ownHUBAI: MoE hot-expert eviction policy: slru | lru | lfu (default: slru)",
+        [](common_params & params, const std::string & value) {
+            params.moe_expert_cache_policy = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_POLICY"));
+    add_opt(common_arg(
+        {"--moe-prefetch"}, "<0|1>",
+        "ownHUBAI: prefetch experts via router/MTP look-ahead when the expert cache is active (default: 1)",
+        [](common_params & params, int value) {
+            params.moe_prefetch = value != 0;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFETCH"));
+    add_opt(common_arg(
+        {"--moe-expert-stats"},
+        "ownHUBAI: log a per-expert activation histogram (routing-skew telemetry for cache sizing)",
+        [](common_params & params) {
+            params.moe_expert_stats = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_STATS"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

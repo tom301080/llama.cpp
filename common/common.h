@@ -501,6 +501,13 @@ struct common_params {
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
+    // --- ownHUBAI: MoE expert-offload (see ownHUBAI docs/adr/0005, moe-expert-offload-concept.md) ---
+    // Expert-granular wired hot-expert cache; cold experts stay mmap'd. Default OFF == stock llama.cpp.
+    int32_t     moe_expert_cache_size   = 0;       // number of wired hot-expert slots (0 = off / mainline)
+    std::string moe_expert_cache_policy = "slru";  // eviction policy: slru | lru | lfu
+    bool        moe_prefetch            = true;    // MTP/router-lookahead expert prefetch (when cache active)
+    bool        moe_expert_stats        = false;   // dump per-expert activation histogram (routing-skew telemetry)
+
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
