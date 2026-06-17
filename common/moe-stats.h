@@ -108,4 +108,15 @@ inline void common_moe_stats_print(const common_moe_stats & st) {
         fprintf(stderr, "  -> smaller = more skew = a hot-expert cache helps more.\n");
     }
     fprintf(stderr, "==============================================================\n");
+    // ownHUBAI: raw per-(layer,expert) dump for offline B0-vs-B1 hit-rate analysis
+    if (FILE * f = fopen("ownhub_moe_usage.csv", "w")) {
+        fprintf(f, "layer,expert,count\n");
+        for (const auto & kv : st.counts) {
+            fprintf(f, "%u,%u,%llu\n",
+                    (uint32_t) (kv.first >> 32), (uint32_t) (kv.first & 0xffffffffu),
+                    (unsigned long long) kv.second);
+        }
+        fclose(f);
+        fprintf(stderr, "[ownHUBAI moe-stats] raw per-(layer,expert) counts -> ownhub_moe_usage.csv\n");
+    }
 }
