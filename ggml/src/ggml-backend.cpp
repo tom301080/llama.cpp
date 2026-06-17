@@ -1589,6 +1589,24 @@ namespace {
                     (unsigned long long) g_slot_hits, (unsigned long long) g_slot_miss, g_slot_sim.size());
         }
     }
+
+    // ownHUBAI B1b: real persistent K-slot GPU expert cache (env OWNHUB_MOE_SLOT_CACHE=K).
+    // Holds the K hottest experts of a (layer,tensor) in a persistent GPU buffer so cache
+    // HITS can skip the per-layer host->GPU copy (the only Apple win — see ADR 0006).
+    // B1b.0 (this step) ONLY allocates the buffer + maps; compute still uses the stock copy
+    // (parity-safe). B1b.1 adds copy-on-miss + the ids remap. Default off == stock.
+    struct ownhub_slot_cache {
+        ggml_backend_buffer_t buf = nullptr;
+        void *  base = nullptr;
+        size_t  expert_size = 0;
+        int     K = 0, n_expert = 0, n_cached = 0;
+        std::vector<int32_t>  slot_of_expert; // expert -> slot (-1 = absent)
+        std::vector<int32_t>  expert_of_slot; // slot -> expert (-1 = free)
+        std::vector<uint64_t> use;            // per-expert LFU count (with aging)
+        uint64_t max_use = 0;
+    };
+    std::unordered_map<std::string, ownhub_slot_cache> g_slot_cache;
+    int g_cache_K = 0, g_cache_on = -1; // g_cache_on: -1 uninit, 0 off, 1 on
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
@@ -1607,6 +1625,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (g_slot_on) {
             fprintf(stderr, "[ownHUBAI B1a] slot-cache SIMULATION on: K=%d slots/tensor "
                             "(instrumentation only — no compute/output change)\n", g_slot_K);
+        }
+    }
+    // ownHUBAI B1b: one-time env read for the real slot cache (default off)
+    if (g_cache_on < 0) {
+        const char * sc = getenv("OWNHUB_MOE_SLOT_CACHE");
+        g_cache_K  = sc ? atoi(sc) : 0;
+        g_cache_on = g_cache_K > 0 ? 1 : 0;
+        if (g_cache_on) {
+            fprintf(stderr, "[ownHUBAI B1b.0] slot-cache ALLOC on: K=%d slots/tensor "
+                            "(B1b.0 — allocate only, compute unchanged, parity-safe)\n", g_cache_K);
         }
     }
 
@@ -1688,6 +1716,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // from the used experts. Instrumentation only — does not touch the copy below.
                     if (g_slot_on) {
                         ownhub_slot_sim_step(input->name, used_ids.data(), (int) n_expert);
+                    }
+
+                    // ownHUBAI B1b.0: lazily allocate the persistent K-slot cache buffer for
+                    // this (layer,tensor). Allocation only — compute below is unchanged (the
+                    // stock copy still runs), so output/parity is identical. B1b.1 will use it.
+                    if (g_cache_on) {
+                        ownhub_slot_cache & c = g_slot_cache[input->name ? input->name : "?"];
+                        if (!c.buf) {
+                            c.n_expert    = (int) n_expert;
+                            c.K           = std::min(g_cache_K, (int) n_expert);
+                            c.expert_size = expert_size;
+                            c.buf = ggml_backend_alloc_buffer(split_backend, (size_t) c.K * expert_size + 512);
+                            if (c.buf) {
+                                c.base = ggml_backend_buffer_get_base(c.buf);
+                                c.slot_of_expert.assign((size_t) n_expert, -1);
+                                c.expert_of_slot.assign((size_t) c.K, -1);
+                                c.use.assign((size_t) n_expert, 0);
+                                fprintf(stderr, "[ownHUBAI B1b.0] alloc '%s': K=%d expert_size=%zu -> %.1f MB\n",
+                                        input->name, c.K, expert_size,
+                                        (double) ((size_t) c.K * expert_size) / 1048576.0);
+                            } else {
+                                fprintf(stderr, "[ownHUBAI B1b.0] alloc FAILED for '%s'\n", input->name);
+                            }
+                        }
                     }
 
                     // group consecutive experts and copy them together
