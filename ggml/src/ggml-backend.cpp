@@ -21,6 +21,10 @@
 #include <string.h>
 #include <algorithm>
 #include <vector>
+#include <unordered_map>  // ownHUBAI B1a
+#include <string>         // ownHUBAI B1a
+#include <algorithm>      // ownHUBAI B1a
+#include <cstdlib>        // ownHUBAI B1a
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1538,6 +1542,55 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// ownHUBAI B1a: slot-cache policy SIMULATION. Measures the online hit rate of an
+// LFU-with-aging K-slot expert cache, per (layer,tensor), from the real routing seen in
+// the scheduler. INSTRUMENTATION ONLY — it never changes the copy/compute/output. Gated on
+// env OWNHUB_MOE_SLOT_SIM=K (K = slots/tensor; unset/0 = off → zero overhead). It exists to
+// validate the realistic B1 hit rate (vs the static hindsight estimate) before the actual
+// (risky) remap surgery in B1b.
+namespace {
+    struct ownhub_slot_sim {
+        std::unordered_map<int32_t, uint64_t> use; // expert -> LFU count (aged)
+        std::vector<int32_t> resident;             // experts currently in the K slots
+        uint64_t max_use = 0;
+    };
+    std::unordered_map<std::string, ownhub_slot_sim> g_slot_sim;
+    uint64_t g_slot_hits = 0, g_slot_miss = 0, g_slot_next = 20000;
+    int g_slot_K = 0, g_slot_on = -1; // g_slot_on: -1 uninit, 0 off, 1 on
+
+    inline void ownhub_slot_sim_step(const char * name, const ggml_bitset_t * used, int n_expert) {
+        ownhub_slot_sim & sc = g_slot_sim[name ? name : "?"];
+        for (int e = 0; e < n_expert; ++e) {
+            if (!ggml_bitset_get(used, e)) continue;
+            uint64_t c = ++sc.use[e];
+            if (c > sc.max_use) sc.max_use = c;
+            if (std::find(sc.resident.begin(), sc.resident.end(), e) != sc.resident.end()) {
+                g_slot_hits++;
+                continue;
+            }
+            g_slot_miss++;
+            if ((int) sc.resident.size() < g_slot_K) {
+                sc.resident.push_back(e);
+            } else if (g_slot_K > 0) {
+                size_t victim = 0; uint64_t lo = UINT64_MAX;
+                for (size_t i = 0; i < sc.resident.size(); ++i) {
+                    uint64_t uc = sc.use[sc.resident[i]];
+                    if (uc < lo) { lo = uc; victim = i; }
+                }
+                sc.resident[victim] = e;
+            }
+        }
+        if (sc.max_use > 128) { for (auto & kv : sc.use) kv.second >>= 1; sc.max_use >>= 1; }
+        uint64_t tot = g_slot_hits + g_slot_miss;
+        if (tot >= g_slot_next) {
+            g_slot_next += 20000;
+            fprintf(stderr, "[ownHUBAI B1a slot-sim] K=%d online hit-rate=%.1f%% (hits=%llu miss=%llu, %zu tensors)\n",
+                    g_slot_K, 100.0 * (double) g_slot_hits / (double) tot,
+                    (unsigned long long) g_slot_hits, (unsigned long long) g_slot_miss, g_slot_sim.size());
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1545,6 +1598,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+
+    // ownHUBAI B1a: one-time env read for the slot-cache simulation (default off)
+    if (g_slot_on < 0) {
+        const char * s = getenv("OWNHUB_MOE_SLOT_SIM");
+        g_slot_K  = s ? atoi(s) : 0;
+        g_slot_on = g_slot_K > 0 ? 1 : 0;
+        if (g_slot_on) {
+            fprintf(stderr, "[ownHUBAI B1a] slot-cache SIMULATION on: K=%d slots/tensor "
+                            "(instrumentation only — no compute/output change)\n", g_slot_K);
+        }
+    }
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1618,6 +1682,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
 
                         prev_ids_tensor = ids_tensor;
+                    }
+
+                    // ownHUBAI B1a: simulate the slot-cache hit rate for this (layer,tensor)
+                    // from the used experts. Instrumentation only — does not touch the copy below.
+                    if (g_slot_on) {
+                        ownhub_slot_sim_step(input->name, used_ids.data(), (int) n_expert);
                     }
 
                     // group consecutive experts and copy them together
