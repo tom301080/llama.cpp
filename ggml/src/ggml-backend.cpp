@@ -1764,10 +1764,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 fprintf(stderr, "[ownHUBAI B1b.0] alloc FAILED for '%s'\n", input->name);
                             }
                         }
-                        // B1b.1a: populate the cache from the used experts (copy misses into
-                        // slots, LFU-evict). Compute is STILL the stock copy below -> parity-safe.
-                        // This exercises the host->slot copy + measures the REAL on-device hit rate.
-                        if (c.buf) {
+                        // B1b.1: cache path is DECODE-ONLY (n_tokens == 1). At prefill the batch
+                        // uses far more distinct experts than K slots -> they can't all be resident
+                        // -> fall through to the stock copy (correct). Decode uses <= top_k experts
+                        // (<= K), so all fit and the remap is lossless.
+                        if (c.buf && ids_tensor->ne[1] == 1) {
                             for (int e = 0; e < (int) n_expert; ++e) {
                                 if (!ggml_bitset_get(used_ids.data(), e)) continue;
                                 uint64_t u = ++c.use[e];
@@ -1820,10 +1821,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                                       ? c.slot_of_expert[e] : 0;
                                 }
                                 c.ids_view = *ids_tensor;           // copy shape/type/stride
-                                c.ids_view.op     = GGML_OP_NONE;   // pure leaf (data only)
+                                c.ids_view.op       = GGML_OP_NONE; // pure leaf (data only)
                                 for (int s = 0; s < GGML_MAX_SRC; ++s) c.ids_view.src[s] = nullptr;
-                                c.ids_view.data   = (char *) c.base + ids_off;   // reuse c.buf (proven get_id-valid)
-                                c.ids_view.buffer = c.buf;
+                                c.ids_view.view_src = nullptr;      // CRUCIAL: ffn_moe_topk is a view; without this,
+                                c.ids_view.view_offs = 0;           // get_id follows view_src->buffer, not our c.buf
+                                c.ids_view.data     = (char *) c.base + ids_off; // reuse c.buf (proven get_id-valid)
+                                c.ids_view.buffer   = c.buf;
                                 ggml_backend_tensor_set_async(split_backend, &c.ids_view, c.remap_host.data(), 0, idsz);
                                 node->src[2]      = &c.ids_view;
                                 input_cpy->data   = c.base;         // point compute at the cache
