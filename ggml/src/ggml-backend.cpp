@@ -1607,6 +1607,7 @@ namespace {
     };
     std::unordered_map<std::string, ownhub_slot_cache> g_slot_cache;
     int g_cache_K = 0, g_cache_on = -1; // g_cache_on: -1 uninit, 0 off, 1 on
+    uint64_t g_cache_hits = 0, g_cache_miss = 0, g_cache_next = 20000; // B1b.1a real on-device hit rate
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
@@ -1738,6 +1739,48 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                         (double) ((size_t) c.K * expert_size) / 1048576.0);
                             } else {
                                 fprintf(stderr, "[ownHUBAI B1b.0] alloc FAILED for '%s'\n", input->name);
+                            }
+                        }
+                        // B1b.1a: populate the cache from the used experts (copy misses into
+                        // slots, LFU-evict). Compute is STILL the stock copy below -> parity-safe.
+                        // This exercises the host->slot copy + measures the REAL on-device hit rate.
+                        if (c.buf) {
+                            for (int e = 0; e < (int) n_expert; ++e) {
+                                if (!ggml_bitset_get(used_ids.data(), e)) continue;
+                                uint64_t u = ++c.use[e];
+                                if (u > c.max_use) c.max_use = u;
+                                if (c.slot_of_expert[e] >= 0) { g_cache_hits++; continue; } // hit
+                                g_cache_miss++;
+                                int slot;
+                                if (c.n_cached < c.K) {
+                                    slot = c.n_cached++;
+                                } else { // LFU-evict the least-used resident expert
+                                    int victim = 0; uint64_t lo = UINT64_MAX;
+                                    for (int s = 0; s < c.K; ++s) {
+                                        uint64_t uc = c.use[c.expert_of_slot[s]];
+                                        if (uc < lo) { lo = uc; victim = s; }
+                                    }
+                                    c.slot_of_expert[c.expert_of_slot[victim]] = -1;
+                                    slot = victim;
+                                }
+                                ggml_tensor dst = {};
+                                dst.buffer = c.buf;
+                                dst.data   = (char *) c.base + (size_t) slot * expert_size;
+                                dst.type   = input->type;
+                                dst.ne[0]  = input->ne[0]; dst.ne[1] = input->ne[1]; dst.ne[2] = 1; dst.ne[3] = 1;
+                                dst.nb[0]  = input->nb[0]; dst.nb[1] = input->nb[1]; dst.nb[2] = expert_size; dst.nb[3] = expert_size;
+                                ggml_backend_tensor_set_async(split_backend, &dst,
+                                        (const char *) input->data + (size_t) e * expert_size, 0, expert_size);
+                                c.slot_of_expert[e]    = slot;
+                                c.expert_of_slot[slot] = e;
+                            }
+                            if (c.max_use > 128) { for (auto & uu : c.use) uu >>= 1; c.max_use >>= 1; }
+                            uint64_t tot = g_cache_hits + g_cache_miss;
+                            if (tot >= g_cache_next) {
+                                g_cache_next += 20000;
+                                fprintf(stderr, "[ownHUBAI B1b.1a] real on-device hit-rate=%.1f%% (hits=%llu miss=%llu) K=%d\n",
+                                        100.0 * (double) g_cache_hits / (double) tot,
+                                        (unsigned long long) g_cache_hits, (unsigned long long) g_cache_miss, g_cache_K);
                             }
                         }
                     }
