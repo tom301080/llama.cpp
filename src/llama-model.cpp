@@ -1222,6 +1222,7 @@ namespace {
         int       n_expert  = 0;
         std::vector<uint32_t> last_used;                     // per-expert last tick used (0 = cold/never)
         std::vector<uint32_t> use_count;                     // inc3c: per-expert cumulative activation frequency
+        std::vector<uint8_t>  resident;                      // inc4: 1 if currently counted toward the budget
     };
     struct ownhub_moe_pager {
         std::vector<ownhub_moe_layer> layers;
@@ -1230,8 +1231,42 @@ namespace {
         uint32_t evict_every = 8;   // run the cold-tail sweep every N forwards (OWNHUB_MOE_EVICT_EVERY)
         uint32_t evict_age   = 32;  // DONTNEED an expert unused for this many forwards (OWNHUB_MOE_EVICT_AGE)
         uint32_t hotset_k    = 0;   // inc3c: protect top-K hottest experts/layer from eviction + re-WILLNEED (OWNHUB_MOE_HOTSET_K, 0=off)
+        size_t   budget_bytes   = 0; // inc4: hard cap on resident expert bytes (OWNHUB_MOE_BUDGET_MB, 0=off) — simulates a smaller machine / is the B2 governor's knob
+        size_t   resident_bytes = 0; // inc4: running estimate of resident expert bytes under the budget
     };
     ownhub_moe_pager g_ownhub_moe_pager;
+
+    // inc4: evict the globally coldest resident expert (LRU) to honor the budget.
+    // This is the same admit/evict-to-fit mechanism the dynamic Strat-B governor will
+    // drive from memory pressure; here the budget is fixed (OWNHUB_MOE_BUDGET_MB).
+    inline size_t ownhub_moe_expert_bytes(const ownhub_moe_layer & L) {
+        return L.bytes[0] + L.bytes[1] + L.bytes[2];
+    }
+    void ownhub_moe_evict_coldest() {
+#if !defined(_WIN32)
+        ownhub_moe_pager & p = g_ownhub_moe_pager;
+        int best_il = -1, best_e = -1;
+        uint32_t best_tick = UINT32_MAX;
+        for (size_t il = 0; il < p.layers.size(); ++il) {
+            ownhub_moe_layer & L = p.layers[il];
+            for (int e = 0; e < (int) L.resident.size(); ++e) {
+                if (L.resident[e] && L.last_used[e] < best_tick) {
+                    best_tick = L.last_used[e]; best_il = (int) il; best_e = e;
+                }
+            }
+        }
+        if (best_il < 0) { p.resident_bytes = 0; return; } // nothing resident → reset
+        ownhub_moe_layer & L = p.layers[best_il];
+        for (int k = 0; k < 3; ++k) {
+            if (L.data[k]) {
+                posix_madvise(L.data[k] + (size_t) best_e * L.stride[k], L.bytes[k], POSIX_MADV_DONTNEED);
+            }
+        }
+        L.resident[best_e] = 0;
+        const size_t b = ownhub_moe_expert_bytes(L);
+        p.resident_bytes = (p.resident_bytes > b) ? p.resident_bytes - b : 0;
+#endif
+    }
 }
 
 int llama_ownhub_moe_active(void) {
@@ -1256,11 +1291,27 @@ void llama_ownhub_moe_advise(int il, const int32_t * experts, int n, int willnee
             if (!L.use_count.empty()) {
                 L.use_count[e]++;    // frequency for the hot-set protection (inc3c)
             }
+            if (p.budget_bytes && !L.resident.empty() && !L.resident[e]) {
+                L.resident[e] = 1;   // inc4: admit into the budgeted resident set
+                p.resident_bytes += ownhub_moe_expert_bytes(L);
+            }
         }
         for (int k = 0; k < 3; ++k) {
             if (L.data[k]) {
                 posix_madvise(L.data[k] + (size_t) e * L.stride[k], L.bytes[k], advice);
             }
+        }
+        if (!willneed && p.budget_bytes && !L.resident.empty() && L.resident[e]) {
+            L.resident[e] = 0;       // inc4: an explicit DONTNEED frees budget
+            const size_t b = ownhub_moe_expert_bytes(L);
+            p.resident_bytes = (p.resident_bytes > b) ? p.resident_bytes - b : 0;
+        }
+    }
+    // inc4: enforce the budget by evicting the coldest resident experts (LRU). The
+    // just-touched experts have last_used == tick (newest) so they are never evicted.
+    if (willneed && p.budget_bytes) {
+        while (p.resident_bytes > p.budget_bytes) {
+            ownhub_moe_evict_coldest();
         }
     }
 #else
@@ -1278,6 +1329,9 @@ void llama_ownhub_moe_step(void) {
         return;
     }
     p.tick++;
+    if (p.budget_bytes) {
+        return; // inc4: budget mode evicts on-admit in advise(); skip the recency sweep
+    }
     if (p.evict_every == 0 || (p.tick % p.evict_every) != 0) {
         return;
     }
@@ -1765,6 +1819,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (const char * s = getenv("OWNHUB_MOE_EVICT_EVERY")) { g_ownhub_moe_pager.evict_every = (uint32_t) atoi(s); }
         if (const char * s = getenv("OWNHUB_MOE_EVICT_AGE"))   { g_ownhub_moe_pager.evict_age   = (uint32_t) atoi(s); }
         if (const char * s = getenv("OWNHUB_MOE_HOTSET_K"))    { g_ownhub_moe_pager.hotset_k    = (uint32_t) atoi(s); }
+        if (const char * s = getenv("OWNHUB_MOE_BUDGET_MB"))   { g_ownhub_moe_pager.budget_bytes = (size_t) atoll(s) * 1024 * 1024; }
+        g_ownhub_moe_pager.resident_bytes = 0;
         g_ownhub_moe_pager.layers.clear();
         g_ownhub_moe_pager.layers.resize(layers.size());
         for (size_t il = 0; il < layers.size(); ++il) {
@@ -1785,12 +1841,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (L.n_expert > 0) {
                 L.last_used.assign((size_t) L.n_expert, 0u); // inc3: per-expert recency for cold-tail eviction
                 L.use_count.assign((size_t) L.n_expert, 0u); // inc3c: per-expert activation frequency
+                L.resident.assign((size_t) L.n_expert, 0u);  // inc4: budgeted resident flags
             }
         }
         g_ownhub_moe_pager.active = do_pager;
-        fprintf(stderr, "[ownHUBAI] MoE offload ACTIVE: random=%d pager=%d hotset_k=%u evict_every=%u evict_age=%u (%zu mmap'd expert tensors, %zu layers)\n",
+        fprintf(stderr, "[ownHUBAI] MoE offload ACTIVE: random=%d pager=%d hotset_k=%u evict_every=%u evict_age=%u budget_mb=%zu (%zu mmap'd expert tensors, %zu layers)\n",
                 (int) do_random, (int) do_pager, g_ownhub_moe_pager.hotset_k,
                 g_ownhub_moe_pager.evict_every, g_ownhub_moe_pager.evict_age,
+                g_ownhub_moe_pager.budget_bytes / (1024 * 1024),
                 tuned, g_ownhub_moe_pager.layers.size());
     }
 #endif
