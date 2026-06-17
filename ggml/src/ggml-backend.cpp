@@ -1604,6 +1604,17 @@ namespace {
         std::vector<int32_t>  expert_of_slot; // slot -> expert (-1 = free)
         std::vector<uint64_t> use;            // per-expert LFU count (with aging)
         uint64_t max_use = 0;
+        // B1b.1b repoint state (zero-copy: point mul_mat_id at the cache + remapped ids)
+        ggml_backend_buffer_t ids_buf = nullptr; // GPU buffer holding the remapped (slot) ids
+        void *  ids_base = nullptr;
+        size_t  ids_cap = 0;
+        ggml_tensor ids_view = {};               // persistent tensor handed to node->src[2]
+        ggml_tensor weight_view = {};            // persistent tensor handed to node->src[0] (= cache, K slots)
+        std::vector<int32_t> remap_host;         // host scratch for the slot ids
+        // restore bookkeeping (the manipulated node/input_cpy from the previous forward)
+        ggml_tensor * rp_node = nullptr;         // node whose src[0]/src[2] were repointed
+        ggml_tensor * rp_orig_src0 = nullptr;
+        ggml_tensor * rp_orig_src2 = nullptr;
     };
     std::unordered_map<std::string, ownhub_slot_cache> g_slot_cache;
     int g_cache_K = 0, g_cache_on = -1; // g_cache_on: -1 uninit, 0 off, 1 on
@@ -1678,6 +1689,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
+                    // ownHUBAI B1b.1b: if we repointed node->src[2] to our slot-id view on the
+                    // previous forward, restore the real ids tensor before reading the routing.
+                    bool cache_handled = false;
+                    if (g_cache_on) {
+                        ownhub_slot_cache & cc = g_slot_cache[input->name ? input->name : "?"];
+                        if (node->src[2] == &cc.ids_view && cc.rp_orig_src2) {
+                            node->src[2] = cc.rp_orig_src2;   // restore for the read
+                        } else {
+                            cc.rp_orig_src2 = node->src[2];   // remember the real ids tensor
+                        }
+                    }
+
                     ggml_backend_synchronize(input_backend);
 
                     // get the ids
@@ -1728,7 +1751,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             c.n_expert    = (int) n_expert;
                             c.K           = std::min(g_cache_K, (int) n_expert);
                             c.expert_size = expert_size;
-                            c.buf = ggml_backend_alloc_buffer(split_backend, (size_t) c.K * expert_size + 512);
+                            c.buf = ggml_backend_alloc_buffer(split_backend, (size_t) c.K * expert_size + 262144); // +256KB for the remapped-ids region (B1b.1b)
                             if (c.buf) {
                                 c.base = ggml_backend_buffer_get_base(c.buf);
                                 c.slot_of_expert.assign((size_t) n_expert, -1);
@@ -1782,6 +1805,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                         100.0 * (double) g_cache_hits / (double) tot,
                                         (unsigned long long) g_cache_hits, (unsigned long long) g_cache_miss, g_cache_K);
                             }
+
+                            // ownHUBAI B1b.1b: all used experts are now resident in the cache, so
+                            // point the MUL_MAT_ID at the cache (K slots) with slot-remapped ids and
+                            // SKIP the stock per-layer copy below. This is the Apple zero-copy win.
+                            const size_t idsz    = ggml_nbytes(ids_tensor);
+                            const size_t ids_off = (size_t) c.K * expert_size;   // ids region lives inside c.buf, after the slots
+                            if (idsz <= 262144 - 4096 && !ids.empty()) {         // fits the reserved region
+                                const size_t nids = idsz / sizeof(int32_t);
+                                c.remap_host.resize(nids);
+                                for (size_t j = 0; j < nids && j < ids.size(); ++j) {
+                                    int32_t e = ids[j];
+                                    c.remap_host[j] = (e >= 0 && e < c.n_expert && c.slot_of_expert[e] >= 0)
+                                                      ? c.slot_of_expert[e] : 0;
+                                }
+                                c.ids_view = *ids_tensor;           // copy shape/type/stride
+                                c.ids_view.op     = GGML_OP_NONE;   // pure leaf (data only)
+                                for (int s = 0; s < GGML_MAX_SRC; ++s) c.ids_view.src[s] = nullptr;
+                                c.ids_view.data   = (char *) c.base + ids_off;   // reuse c.buf (proven get_id-valid)
+                                c.ids_view.buffer = c.buf;
+                                ggml_backend_tensor_set_async(split_backend, &c.ids_view, c.remap_host.data(), 0, idsz);
+                                node->src[2]      = &c.ids_view;
+                                input_cpy->data   = c.base;         // point compute at the cache
+                                input_cpy->buffer = c.buf;
+                                input_cpy->ne[2]  = c.K;
+                                input_cpy->nb[3]  = (size_t) c.K * expert_size;
+                                cache_handled = true;
+                            }
                         }
                     }
 
@@ -1800,6 +1850,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             expert_size_copy + padding_end);
                     };
 
+                    // ownHUBAI B1b.1b: skip the stock per-layer copy when the cache handled it
+                    // (compute already repointed at the cache + slot ids above).
+                    if (!cache_handled) {
                     int id = 0;
                     while (!ggml_bitset_get(used_ids.data(), id)) {
                         id++;
@@ -1823,6 +1876,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+                    }
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
